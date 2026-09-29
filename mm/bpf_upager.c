@@ -45,12 +45,18 @@ static int bpf_upager_init_member(const struct btf_type *t,
 	struct upager_ops *ops = kdata;
 	u32 moff = __btf_member_bit_offset(t, member) / 8;
 
-	if (moff != offsetof(struct upager_ops, name))
-		return 0;
-
-	if (bpf_obj_name_cpy(ops->name, uops->name, sizeof(ops->name)) <= 0)
-		return -EINVAL;
-	return 1;
+	switch (moff) {
+	case offsetof(struct upager_ops, flags):
+		if (uops->flags & ~UPAGER_F_ALL)
+			return -EINVAL;
+		ops->flags = uops->flags;
+		return 1;
+	case offsetof(struct upager_ops, name):
+		if (bpf_obj_name_cpy(ops->name, uops->name, sizeof(ops->name)) <= 0)
+			return -EINVAL;
+		return 1;
+	}
+	return 0;
 }
 
 static int bpf_upager_reg(void *kdata, struct bpf_link *link)
@@ -109,8 +115,10 @@ void upager_isolate(struct upager_ctx *ctx)
 
 	rcu_read_lock();
 	ops = rcu_dereference(bpf_upager);
-	if (ops)
+	if (ops) {
+		ctx->flags = ops->flags;
 		ops->isolate(ctx);
+	}
 	rcu_read_unlock();
 }
 

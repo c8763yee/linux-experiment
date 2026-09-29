@@ -4836,13 +4836,11 @@ int lru_gen_isolate_hint(struct upager_ctx *ctx, u64 pfn)
 	if (ctx->nr_isolated >= ctx->nr_to_scan)
 		return -ENOSPC;
 
-	if (!pfn_valid(pfn))
+	/* pfn_valid() alone is also true for offlined memory sections. */
+	page = pfn_to_online_page(pfn);
+	if (!page)
 		return -EINVAL;
 
-	/* TODO security review: pfn_valid() is also true for offlined
-	 * memory sections; use pfn_to_online_page() instead.
-	 */
-	page = pfn_to_page(pfn);
 	folio = page_folio(page);
 	if (folio_is_zone_device(folio))
 		return -EINVAL;
@@ -4923,6 +4921,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	int type;
 	int scanned;
 	int hinted = 0;
+	bool hint_ignore_refs = false;
 	int reclaimed;
 	LIST_HEAD(list);
 	LIST_HEAD(hint);
@@ -4948,6 +4947,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 
 		upager_isolate(&ctx);
 		hinted = ctx.nr_isolated;
+		hint_ignore_refs = ctx.flags & UPAGER_F_IGNORE_REFS;
 	}
 
 	lruvec_lock_irq(lruvec);
@@ -4970,13 +4970,28 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 		item = PGSCAN_KSWAPD + reclaimer_offset(sc);
 		mod_lruvec_state(lruvec, item, hinted);
 		mod_lruvec_state(lruvec, PGSCAN_ANON, hinted);
-		list_splice(&hint, &list);
+		if (!hint_ignore_refs)
+			list_splice_init(&hint, &list);
 	}
 
-	if (list_empty(&list))
+	if (list_empty(&list) && list_empty(&hint))
 		return scanned;
 retry:
 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);
+	/*
+	 * Hints bypass aging, so their PTEs are typically still young and
+	 * folio_check_references() would keep them. Only the first pass
+	 * sees @hint; leftovers join @list for the putback loop below.
+	 */
+	if (!list_empty(&hint)) {
+		struct reclaim_stat hint_stat;
+
+		reclaimed += shrink_folio_list(&hint, pgdat, sc, &hint_stat,
+					       true, memcg);
+		stat.nr_unqueued_dirty += hint_stat.nr_unqueued_dirty;
+		stat.nr_demoted += hint_stat.nr_demoted;
+		list_splice_init(&hint, &list);
+	}
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
 	sc->nr_reclaimed += reclaimed;
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
