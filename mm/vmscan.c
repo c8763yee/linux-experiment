@@ -4819,13 +4819,113 @@ static int isolate_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	return 0;
 }
 
+/*
+ * kfunc body for bpf_upager_isolate_pfn(): isolate a BPF-chosen, fully
+ * untrusted pfn into ctx->list. Mirrors isolate_folio() plus the lruvec
+ * ownership check from compaction's isolate_migratepages_block(), since
+ * @pfn's folio need not belong to ctx->lruvec. folio_put() only ever runs
+ * after any lock taken here has been dropped.
+ */
+int lru_gen_isolate_hint(struct upager_ctx *ctx, u64 pfn)
+{
+	int err;
+	struct page *page;
+	struct folio *folio;
+	struct lruvec *lv;
+
+	if (ctx->nr_isolated >= ctx->nr_to_scan)
+		return -ENOSPC;
+
+	if (!pfn_valid(pfn))
+		return -EINVAL;
+
+	/* TODO security review: pfn_valid() is also true for offlined
+	 * memory sections; use pfn_to_online_page() instead.
+	 */
+	page = pfn_to_page(pfn);
+	folio = page_folio(page);
+	if (folio_is_zone_device(folio))
+		return -EINVAL;
+
+	if (!folio_try_get(folio))
+		return -ENOENT;
+
+	/* The ref pins @folio, but @page may have been split away from it. */
+	if (unlikely(page_folio(page) != folio)) {
+		err = -EBUSY;
+		goto put;
+	}
+
+	if (folio_test_large(folio))
+		err = -E2BIG;
+	else if (!folio_test_anon(folio))
+		err = -EINVAL;
+	else if (!folio_test_lru(folio) || folio_test_unevictable(folio))
+		err = -EBUSY;
+	else if (folio_zonenum(folio) > ctx->reclaim_idx)
+		err = -ERANGE;
+	else if (!(ctx->gfp_mask & __GFP_IO) &&
+		 (folio_test_dirty(folio) || !folio_test_swapcache(folio)))
+		err = -EAGAIN;
+	else
+		err = 0;
+	if (err)
+		goto put;
+
+	if (!folio_test_clear_lru(folio)) {
+		err = -EBUSY;
+		goto put;
+	}
+
+	lv = folio_lruvec_lock_irq(folio);
+	if (lv != ctx->lruvec) {
+		folio_set_lru(folio);
+		lruvec_unlock_irq(lv);
+		err = -EXDEV;
+		goto put;
+	}
+
+	/* Unlocked checks above are racy; sort_folio() or lru_gen_switching()
+	 * may have moved this folio off the generation lists we expect.
+	 */
+	if (folio_test_unevictable(folio) || folio_test_active(folio) ||
+	    folio_lru_gen(folio) < 0) {
+		folio_set_lru(folio);
+		lruvec_unlock_irq(lv);
+		err = -EBUSY;
+		goto put;
+	}
+
+	if (!folio_test_referenced(folio))
+		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, 0);
+	folio_clear_reclaim(folio);
+
+	if (!lru_gen_del_folio(lv, folio, true)) {
+		/* Defensive: unreachable after the recheck above. */
+		folio_set_lru(folio);
+		lruvec_unlock_irq(lv);
+		err = -EBUSY;
+		goto put;
+	}
+	lruvec_unlock_irq(lv);
+
+	list_add(&folio->lru, ctx->list);
+	ctx->nr_isolated++;
+	return 0;
+put:
+	folio_put(folio);
+	return err;
+}
+
 static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 			struct scan_control *sc, int swappiness)
 {
 	int type;
 	int scanned;
+	int hinted = 0;
 	int reclaimed;
 	LIST_HEAD(list);
+	LIST_HEAD(hint);
 	LIST_HEAD(clean);
 	struct folio *folio;
 	struct folio *next;
@@ -4837,9 +4937,27 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
+	if (lru_gen_enabled()) {
+		struct upager_ctx ctx = {
+			.lruvec = lruvec,
+			.list = &hint,
+			.gfp_mask = sc->gfp_mask,
+			.reclaim_idx = sc->reclaim_idx,
+			.nr_to_scan = min_t(unsigned long, nr_to_scan, U32_MAX),
+		};
+
+		upager_isolate(&ctx);
+		hinted = ctx.nr_isolated;
+	}
+
 	lruvec_lock_irq(lruvec);
 
-	scanned = isolate_folios(nr_to_scan, lruvec, sc, swappiness, &type, &list);
+	scanned = hinted;
+	if ((unsigned long)hinted < nr_to_scan)
+		scanned += isolate_folios(nr_to_scan - hinted, lruvec, sc, swappiness,
+					   &type, &list);
+	else
+		type = LRU_GEN_ANON;
 
 	scanned += try_to_inc_min_seq(lruvec, swappiness);
 
@@ -4847,6 +4965,13 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 		scanned = 0;
 
 	lruvec_unlock_irq(lruvec);
+
+	if (hinted) {
+		item = PGSCAN_KSWAPD + reclaimer_offset(sc);
+		mod_lruvec_state(lruvec, item, hinted);
+		mod_lruvec_state(lruvec, PGSCAN_ANON, hinted);
+		list_splice(&hint, &list);
+	}
 
 	if (list_empty(&list))
 		return scanned;
@@ -4875,7 +5000,8 @@ retry:
 		}
 
 		/* don't add rejected folios to the oldest generation */
-		if (lru_gen_folio_seq(lruvec, folio, false) == min_seq[type])
+		if (lru_gen_folio_seq(lruvec, folio, false) ==
+		    min_seq[folio_is_file_lru(folio)])
 			set_mask_bits(&folio->flags.f, LRU_REFS_FLAGS, BIT(PG_active));
 	}
 

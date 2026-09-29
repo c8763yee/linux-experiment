@@ -19,6 +19,7 @@
 #include <linux/leafops.h>
 #include <linux/swap_cgroup.h>
 #include <linux/tracepoint-defs.h>
+#include <linux/upager.h>
 
 /* Internal core VMA manipulation functions. */
 #include "vma.h"
@@ -1951,5 +1952,12 @@ static inline int get_sysctl_max_map_count(void)
 
 bool may_expand_vm(struct mm_struct *mm, const vma_flags_t *vma_flags,
 		   unsigned long npages);
+
+#ifdef CONFIG_LRU_GEN
+/* mm/bpf_upager.c: run the attached upager_ops->isolate(), if any. */
+void upager_isolate(struct upager_ctx *ctx);
+/* mm/vmscan.c: kfunc body for bpf_upager_isolate_pfn(), untrusted pfn. */
+int lru_gen_isolate_hint(struct upager_ctx *ctx, u64 pfn);
+#endif
 
 #endif	/* __MM_INTERNAL_H */
