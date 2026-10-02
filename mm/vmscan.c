@@ -4821,10 +4821,11 @@ static int isolate_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 
 /*
  * kfunc body for bpf_upager_isolate_pfn(): isolate a BPF-chosen, fully
- * untrusted pfn into ctx->list. Mirrors isolate_folio() plus the lruvec
- * ownership check from compaction's isolate_migratepages_block(), since
- * @pfn's folio need not belong to ctx->lruvec. folio_put() only ever runs
- * after any lock taken here has been dropped.
+ * untrusted pfn, anon or page cache, into ctx->list. Mirrors isolate_folio()
+ * plus the lruvec ownership check from compaction's
+ * isolate_migratepages_block(), since @pfn's folio need not belong to
+ * ctx->lruvec. folio_put() only ever runs after any lock taken here has been
+ * dropped.
  */
 int lru_gen_isolate_hint(struct upager_ctx *ctx, u64 pfn)
 {
@@ -4854,16 +4855,21 @@ int lru_gen_isolate_hint(struct upager_ctx *ctx, u64 pfn)
 		goto put;
 	}
 
+	/*
+	 * UPAGER_F_IGNORE_REFS skips folio_check_references(), so a hint must
+	 * not evict page cache that some other mapping is still using.
+	 */
 	if (folio_test_large(folio))
 		err = -E2BIG;
-	else if (!folio_test_anon(folio))
-		err = -EINVAL;
 	else if (!folio_test_lru(folio) || folio_test_unevictable(folio))
 		err = -EBUSY;
+	else if (!folio_test_anon(folio) && folio_maybe_mapped_shared(folio))
+		err = -EPERM;
 	else if (folio_zonenum(folio) > ctx->reclaim_idx)
 		err = -ERANGE;
 	else if (!(ctx->gfp_mask & __GFP_IO) &&
-		 (folio_test_dirty(folio) || !folio_test_swapcache(folio)))
+		 (folio_test_dirty(folio) ||
+		  (folio_test_anon(folio) && !folio_test_swapcache(folio))))
 		err = -EAGAIN;
 	else
 		err = 0;
@@ -4915,12 +4921,26 @@ put:
 	return err;
 }
 
+/* Hints are order-0 only, so folios count as pages. */
+static int nr_file_folios(struct list_head *list)
+{
+	int nr = 0;
+	struct folio *folio;
+
+	list_for_each_entry(folio, list, lru)
+		nr += folio_is_file_lru(folio);
+
+	return nr;
+}
+
 static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 			struct scan_control *sc, int swappiness)
 {
 	int type;
 	int scanned;
 	int hinted = 0;
+	int hinted_file = 0;
+	int hint_reclaimed;
 	bool hint_ignore_refs = false;
 	int reclaimed;
 	LIST_HEAD(list);
@@ -4969,25 +4989,33 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	if (hinted) {
 		item = PGSCAN_KSWAPD + reclaimer_offset(sc);
 		mod_lruvec_state(lruvec, item, hinted);
-		mod_lruvec_state(lruvec, PGSCAN_ANON, hinted);
-		if (!hint_ignore_refs)
-			list_splice_init(&hint, &list);
+		hinted_file = nr_file_folios(&hint);
+		mod_lruvec_state(lruvec, PGSCAN_ANON, hinted - hinted_file);
+		mod_lruvec_state(lruvec, PGSCAN_FILE, hinted_file);
 	}
 
 	if (list_empty(&list) && list_empty(&hint))
 		return scanned;
 retry:
+	hint_reclaimed = 0;
 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);
 	/*
 	 * Hints bypass aging, so their PTEs are typically still young and
-	 * folio_check_references() would keep them. Only the first pass
-	 * sees @hint; leftovers join @list for the putback loop below.
+	 * folio_check_references() would keep them unless the BPF program
+	 * asked to ignore that. @hint is shrunk on its own because it mixes
+	 * anon and file, unlike @list. Only the first pass sees @hint;
+	 * leftovers join @list for the putback loop below.
 	 */
 	if (!list_empty(&hint)) {
 		struct reclaim_stat hint_stat;
+		int file;
 
-		reclaimed += shrink_folio_list(&hint, pgdat, sc, &hint_stat,
-					       true, memcg);
+		hint_reclaimed = shrink_folio_list(&hint, pgdat, sc, &hint_stat,
+						   hint_ignore_refs, memcg);
+		file = hinted_file - nr_file_folios(&hint);
+		mod_lruvec_state(lruvec, PGSTEAL_ANON, hint_reclaimed - file);
+		mod_lruvec_state(lruvec, PGSTEAL_FILE, file);
+		reclaimed += hint_reclaimed;
 		stat.nr_unqueued_dirty += hint_stat.nr_unqueued_dirty;
 		stat.nr_demoted += hint_stat.nr_demoted;
 		list_splice_init(&hint, &list);
@@ -5035,7 +5063,7 @@ retry:
 
 	item = PGSTEAL_KSWAPD + reclaimer_offset(sc);
 	mod_lruvec_state(lruvec, item, reclaimed);
-	mod_lruvec_state(lruvec, PGSTEAL_ANON + type, reclaimed);
+	mod_lruvec_state(lruvec, PGSTEAL_ANON + type, reclaimed - hint_reclaimed);
 
 	list_splice_init(&clean, &list);
 
