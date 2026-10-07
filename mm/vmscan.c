@@ -4830,6 +4830,7 @@ static int isolate_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 int lru_gen_isolate_hint(struct upager_ctx *ctx, u64 pfn)
 {
 	int err;
+	int type;
 	struct page *page;
 	struct folio *folio;
 	struct lruvec *lv;
@@ -4900,6 +4901,20 @@ int lru_gen_isolate_hint(struct upager_ctx *ctx, u64 pfn)
 		goto put;
 	}
 
+	/*
+	 * A hint must not evict what aging has kept: take only what
+	 * scan_folios() could isolate right now, i.e. a folio that
+	 * sort_folio() would not treat as promoted.
+	 */
+	type = folio_is_file_lru(folio);
+	if (get_nr_gens(lv, type) == MIN_NR_GENS ||
+	    folio_lru_gen(folio) != lru_gen_from_seq(lv->lrugen.min_seq[type])) {
+		folio_set_lru(folio);
+		lruvec_unlock_irq(lv);
+		err = -EACCES;
+		goto put;
+	}
+
 	if (!folio_test_referenced(folio))
 		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, 0);
 	folio_clear_reclaim(folio);
@@ -4942,6 +4957,8 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	int hinted_file = 0;
 	int hint_reclaimed;
 	bool hint_ignore_refs = false;
+	/* one batch, like scan_folios(): more would stall this reclaimer */
+	unsigned long nr_hint = min(nr_to_scan, MIN_LRU_BATCH);
 	int reclaimed;
 	LIST_HEAD(list);
 	LIST_HEAD(hint);
@@ -4962,7 +4979,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 			.list = &hint,
 			.gfp_mask = sc->gfp_mask,
 			.reclaim_idx = sc->reclaim_idx,
-			.nr_to_scan = min_t(unsigned long, nr_to_scan, U32_MAX),
+			.nr_to_scan = nr_hint,
 		};
 
 		upager_isolate(&ctx);
@@ -4973,7 +4990,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	lruvec_lock_irq(lruvec);
 
 	scanned = hinted;
-	if ((unsigned long)hinted < nr_to_scan)
+	if ((unsigned long)hinted < nr_hint)
 		scanned += isolate_folios(nr_to_scan - hinted, lruvec, sc, swappiness,
 					   &type, &list);
 	else
