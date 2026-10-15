@@ -1319,6 +1319,8 @@ static bool folio_try_unmap(struct folio *folio, struct reclaim_stat *stat,
 	return true;
 }
 
+static DEFINE_STATIC_KEY_FALSE(vmscan_batch_flush);
+
 /*
  * Reclaimed folios are counted in the return value.
  */
@@ -1334,6 +1336,7 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	unsigned int nr_reclaimed = 0, nr_demoted = 0;
 	unsigned int pgactivate = 0;
 	bool do_demote_pass;
+	bool batch_flush = static_branch_unlikely(&vmscan_batch_flush);
 	struct swap_iocb *plug = NULL;
 
 	folio_batch_init(&free_folios);
@@ -1632,6 +1635,14 @@ retry:
 				goto keep_locked;
 			if (!sc->may_writepage)
 				goto keep_locked;
+			if (!batch_flush) {
+				try_to_unmap_flush_dirty();
+				if (!folio_try_pageout(folio, &free_folios, sc,
+						       stat, &plug, folio_list,
+						       &nr_reclaimed))
+					goto keep;
+				continue;
+			}
 			/*
 			 * Drop the lock so swap faults finding this folio
 			 * via swap cache lookup can make progress; the
@@ -7819,6 +7830,59 @@ static const struct ctl_table vmscan_sysctl_table[] = {
 	}
 #endif
 };
+
+static ssize_t batch_flush_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", static_key_enabled(&vmscan_batch_flush));
+}
+
+static ssize_t batch_flush_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t len)
+{
+	bool enable;
+	int err;
+
+	err = kstrtobool(buf, &enable);
+	if (err)
+		return err;
+
+	if (enable)
+		static_branch_enable(&vmscan_batch_flush);
+	else
+		static_branch_disable(&vmscan_batch_flush);
+
+	return len;
+}
+
+static struct kobj_attribute batch_flush_attr = __ATTR_RW(batch_flush);
+
+static struct attribute *vmscan_attrs[] = {
+	&batch_flush_attr.attr,
+	NULL
+};
+
+static const struct attribute_group vmscan_attr_group = {
+	.attrs = vmscan_attrs,
+};
+
+static int __init vmscan_sysfs_init(void)
+{
+	struct kobject *kobj;
+	int err;
+
+	kobj = kobject_create_and_add("vmscan", mm_kobj);
+	if (!kobj)
+		return -ENOMEM;
+
+	err = sysfs_create_group(kobj, &vmscan_attr_group);
+	if (err)
+		kobject_put(kobj);
+
+	return err;
+}
+late_initcall(vmscan_sysfs_init);
 
 static int __init kswapd_init(void)
 {
