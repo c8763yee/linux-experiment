@@ -4853,6 +4853,45 @@ static int memory_numa_stat_show(struct seq_file *m, void *v)
 }
 #endif
 
+#ifdef CONFIG_LRU_GEN_SHIFT
+static int memory_shift_show(struct seq_file *m, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	int nid, type, bucket;
+
+	seq_puts(m, "type shift");
+	for_each_node_state(nid, N_MEMORY)
+		seq_printf(m, " N%d", nid);
+	seq_putc(m, '\n');
+
+	/*
+	 * Each (memcg, node) lruvec has its own feedback controller.
+	 * Report local counts without aggregating descendant memcgs.
+	 */
+	for (type = 0; type < ANON_AND_FILE; type++) {
+		const char *name = type == LRU_GEN_FILE ? "file" : "anon";
+
+		for (bucket = 0; bucket <= BITS_PER_LONG; bucket++) {
+			if (bucket == BITS_PER_LONG)
+				seq_printf(m, "%s >=%u", name, BITS_PER_LONG);
+			else
+				seq_printf(m, "%s %d", name, bucket);
+
+			for_each_node_state(nid, N_MEMORY) {
+				struct lruvec *lruvec;
+
+				lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+				seq_printf(m, " %lu", READ_ONCE(
+					lruvec->lrugen.shift_hist[type][bucket]));
+			}
+			seq_putc(m, '\n');
+		}
+	}
+
+	return 0;
+}
+#endif
+
 static int memory_oom_group_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
@@ -4951,6 +4990,13 @@ static struct cftype memory_files[] = {
 		.name = "stat",
 		.seq_show = memory_stat_show,
 	},
+#ifdef CONFIG_LRU_GEN_SHIFT
+	{
+		.name = "shift",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = memory_shift_show,
+	},
+#endif
 #ifdef CONFIG_NUMA
 	{
 		.name = "numa_stat",
