@@ -3199,6 +3199,7 @@ static void reset_ctrl_pos(struct lruvec *lruvec, int type, bool carryover)
 		 */
 		this_cpu_ptr(&mglru_shift_histogram)->
 			count[type][min(shift, (unsigned long)BITS_PER_LONG)]++;
+		lrugen->shift_hist[type][min(shift, (unsigned long)BITS_PER_LONG)]++;
 #endif
 		/* Record the raw shift above, but never shift by >= BITS_PER_LONG. */
 		shift = min(shift, (unsigned long)BITS_PER_LONG - 1);
