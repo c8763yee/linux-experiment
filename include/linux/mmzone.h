@@ -572,6 +572,10 @@ struct lru_gen_folio {
 	unsigned long avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
 	/* the exponential moving average of evicted+protected */
 	unsigned long avg_total[ANON_AND_FILE][MAX_NR_TIERS];
+#ifdef CONFIG_LRU_GEN_SHIFT
+	/* Local carryover counts, updated under lruvec->lru_lock. */
+	unsigned long shift_hist[ANON_AND_FILE][BITS_PER_LONG + 1];
+#endif
 	/* can only be modified under the LRU lock */
 	unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
 	/* can be modified without holding the LRU lock */
