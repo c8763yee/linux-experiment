@@ -47,6 +47,8 @@
 #include <linux/folio_batch.h>
 #include <linux/prefetch.h>
 #include <linux/printk.h>
+#include <linux/percpu.h>
+#include <linux/seq_file.h>
 #include <linux/dax.h>
 #include <linux/psi.h>
 #include <linux/pagewalk.h>
@@ -3129,6 +3131,15 @@ static bool lru_gen_shift_enabled(void)
 {
 	return static_branch_unlikely(&lru_gen_shift_key);
 }
+
+/* The last bucket counts shifts that are too large for an unsigned long. */
+#define NR_MGLRU_SHIFT_BUCKETS	(BITS_PER_LONG + 1)
+
+struct mglru_shift_histogram {
+	unsigned long count[ANON_AND_FILE][NR_MGLRU_SHIFT_BUCKETS];
+};
+
+static DEFINE_PER_CPU(struct mglru_shift_histogram, mglru_shift_histogram);
 #endif
 
 struct ctrl_pos {
@@ -3181,6 +3192,14 @@ static void reset_ctrl_pos(struct lruvec *lruvec, int type, bool carryover)
 			min_ttl = READ_ONCE(lru_gen_min_ttl);
 #endif
 		shift = lru_gen_decay_shift(delta, min_ttl);
+#ifdef CONFIG_LRU_GEN_SHIFT
+		/*
+		 * lruvec->lru_lock is held with local IRQs disabled, so the
+		 * current CPU cannot change while updating its histogram.
+		 */
+		this_cpu_ptr(&mglru_shift_histogram)->
+			count[type][min(shift, (unsigned long)BITS_PER_LONG)]++;
+#endif
 	}
 
 	for (tier = 0; tier < MAX_NR_TIERS; tier++) {
@@ -5853,6 +5872,40 @@ static const struct file_operations lru_gen_ro_fops = {
 	.release = seq_release,
 };
 
+#ifdef CONFIG_LRU_GEN_SHIFT
+static int mglru_shift_histogram_show(struct seq_file *m, void *v)
+{
+	int cpu, type, bucket;
+
+	seq_puts(m, "type shift count\n");
+
+	for (type = 0; type < ANON_AND_FILE; type++) {
+		const char *name = type == LRU_GEN_FILE ? "file" : "anon";
+
+		for (bucket = 0; bucket < NR_MGLRU_SHIFT_BUCKETS; bucket++) {
+			u64 count = 0;
+
+			for_each_possible_cpu(cpu)
+				count += READ_ONCE(per_cpu(mglru_shift_histogram, cpu).
+						   count[type][bucket]);
+
+			if (!count)
+				continue;
+
+			if (bucket == BITS_PER_LONG)
+				seq_printf(m, "%s >=%u %llu\n", name,
+					   BITS_PER_LONG, (unsigned long long)count);
+			else
+				seq_printf(m, "%s %d %llu\n", name, bucket,
+					   (unsigned long long)count);
+		}
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(mglru_shift_histogram);
+#endif
+
 /******************************************************************************
  *                          initialization
  ******************************************************************************/
@@ -5943,6 +5996,10 @@ static int __init init_lru_gen(void)
 				    &lru_gen_rw_fops);
 	debugfs_create_file_aux_num("lru_gen_full", 0444, NULL, NULL, true,
 				    &lru_gen_ro_fops);
+#ifdef CONFIG_LRU_GEN_SHIFT
+	debugfs_create_file("mglru_shift_stats", 0444, NULL, NULL,
+			    &mglru_shift_histogram_fops);
+#endif
 
 	return 0;
 };
